@@ -20,4 +20,4 @@
 #别人的软件包
 sed -i "/helloworld/d" "feeds.conf.default"
 echo "src-git helloworld https://github.com/fw876/helloworld.git" >> "feeds.conf.default"
-
+echo "src-git helloworld https://github.com/kenzok8/openwrt-packages.git" >> "feeds.conf.default"

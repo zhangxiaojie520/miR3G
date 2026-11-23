@@ -1,0 +1,211 @@
+name: Build EasyTier 2.6.4 ultra-slim mipsel
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: s1
+            abort: "0"
+            nowss: "0"
+            fmtdebug: "0"
+          - variant: s2
+            abort: "1"
+            nowss: "0"
+            fmtdebug: "0"
+          - variant: s3
+            abort: "1"
+            nowss: "1"
+            fmtdebug: "0"
+          - variant: s4
+            abort: "1"
+            nowss: "1"
+            fmtdebug: "1"
+    env:
+      TARGET: mipsel-unknown-linux-musl
+      FEATURES: websocket,tun,aes-gcm
+      VARIANT: ${{ matrix.variant }}
+      ABORT: ${{ matrix.abort }}
+      NOWSS: ${{ matrix.nowss }}
+      FMTDEBUG: ${{ matrix.fmtdebug }}
+    steps:
+      - name: Check out helper scripts
+        uses: actions/checkout@v4
+        with:
+          path: helper
+          persist-credentials: false
+
+      - name: Check out EasyTier v2.6.4
+        uses: actions/checkout@v4
+        with:
+          repository: EasyTier/EasyTier
+          ref: v2.6.4
+          path: source
+          persist-credentials: false
+
+      - name: Apply ultra-slim patches
+        run: |
+          set -euo pipefail
+          python3 helper/scripts/et264_ultra/patch.py source
+          echo "----- slim entrypoint -----"
+          head -14 source/easytier/src/easytier-core.rs
+          echo "----- ws scheme match -----"
+          grep -n -A4 'fn is_wss' source/easytier/src/tunnel/websocket.rs || true
+          echo "----- websocket feature -----"
+          grep -n -A6 '^websocket = ' source/easytier/Cargo.toml || true
+          echo "----- mipsel rustflags -----"
+          grep -n -A8 'target.mipsel-unknown-linux-musl' source/.cargo/config.toml | head -14 || true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -qqy build-essential mold musl-tools
+
+      - name: Set up protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "35.1"
+          repo-token: ${{ github.token }}
+
+      - name: Set up Rust 1.95 with rust-src
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+          components: rust-src
+
+      - name: Set up mipsel cross toolchain
+        working-directory: source
+        run: |
+          set -euo pipefail
+          musl_target="mipsel-unknown-linux-muslsf"
+          archive="${musl_target}.tar.xz"
+          archive_sha=36d8b864b3f6d27558d3f19695a4a39b79a873086edc60bebf733777df2b8359
+          mkdir -p musl_gcc
+          wget --inet4-only -q "https://github.com/cross-tools/musl-cross/releases/download/20250520/$archive" -P musl_gcc/
+          echo "$archive_sha  musl_gcc/$archive" | sha256sum --check --strict
+          tar xf "musl_gcc/$archive" -C musl_gcc/
+          chmod -R u+w "musl_gcc/$musl_target"
+          echo "$PWD/musl_gcc/$musl_target/bin" >> "$GITHUB_PATH"
+          ln -sfn "$PWD/musl_gcc/$musl_target/$musl_target/sysroot" musl_gcc/sysroot
+          echo "BINDGEN_EXTRA_CLANG_ARGS=--sysroot=$PWD/musl_gcc/$musl_target/$musl_target/sysroot" >> "$GITHUB_ENV"
+          gcc_dir="musl_gcc/$musl_target/lib/gcc/$musl_target/15.1.0"
+          cp "$gcc_dir/libgcc_eh.a" "$gcc_dir/libunwind.a"
+          (
+            cd "$gcc_dir"
+            ar x libgcc.a _ctzsi2.o _clz.o _bswapsi2.o
+            ar rcs libctz.a _ctzsi2.o _clz.o _bswapsi2.o
+          )
+
+      - name: Build easytier-core
+        working-directory: source
+        run: |
+          set -euo pipefail
+          if [ "$ABORT" = "1" ]; then
+            STD_FEATURES="optimize_for_size,panic_immediate_abort"
+          else
+            STD_FEATURES="optimize_for_size"
+          fi
+          echo "variant=$VARIANT features=$FEATURES abort=$ABORT nowss=$NOWSS fmtdebug=$FMTDEBUG std=$STD_FEATURES"
+          PATH="$PWD/musl_gcc/mipsel-unknown-linux-muslsf/bin:$PATH" RUSTC_BOOTSTRAP=1 \
+            cargo build --target "$TARGET" --profile mini \
+            -Z build-std=std,panic_abort -Z build-std-features="$STD_FEATURES" \
+            -p easytier --bin easytier-core --no-default-features --features "$FEATURES" 2>&1 | tail -120
+
+      - name: Inspect binary
+        working-directory: source
+        run: |
+          set -euo pipefail
+          BIN="target/$TARGET/mini/easytier-core"
+          if [ ! -f "$BIN" ]; then
+            echo "BUILD FAILED - binary not found"
+            exit 1
+          fi
+          echo "===== SIZE variant $VARIANT features $FEATURES abort=$ABORT nowss=$NOWSS fmtdebug=$FMTDEBUG ====="
+          wc -c "$BIN"
+          du -h "$BIN"
+          file "$BIN" || true
+          echo "===== wss / tls residue (string counts) ====="
+          for kw in wss rustls webpki-roots TlsAcceptor tokio_rustls; do
+            cnt=$(strings "$BIN" | grep -ic "$kw" || true)
+            echo "  $kw: $cnt"
+          done
+          echo "===== banned protocol mention counts ====="
+          for kw in kcp quic boringtun; do
+            cnt=$(strings "$BIN" | grep -ic "$kw" || true)
+            echo "  $kw: $cnt"
+          done
+
+      - name: Package and publish release
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BIN="target/$TARGET/mini/easytier-core"
+          mkdir -p package
+          OUT="easytier264-ultra-$VARIANT-mipsel"
+          cp "$BIN" "package/$OUT"
+          chmod +x "package/$OUT"
+          gzip -9 -c "package/$OUT" > "package/$OUT.gz"
+          sha256sum "package/$OUT" "package/$OUT.gz" || true
+          ls -l package/
+          SIZE=$(wc -c < "package/$OUT")
+          cd package
+          TAG="et264-ultra-$VARIANT-$(date +%s)"
+          gh release create "$TAG" "$OUT.gz" --repo "$GITHUB_REPOSITORY" --title "EasyTier 2.6.4 ultra $VARIANT - $SIZE bytes" --notes "slim main, abort=$ABORT nowss=$NOWSS fmtdebug=$FMTDEBUG, features=$FEATURES, mipsel musl static, no UPX. Raw size $SIZE bytes."
+          echo "created release $TAG raw=$SIZE"
+
+  bloat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    continue-on-error: true
+    env:
+      NOWSS: "0"
+      FMTDEBUG: "0"
+    steps:
+      - name: Check out helper scripts
+        uses: actions/checkout@v4
+        with:
+          path: helper
+          persist-credentials: false
+
+      - name: Check out EasyTier v2.6.4
+        uses: actions/checkout@v4
+        with:
+          repository: EasyTier/EasyTier
+          ref: v2.6.4
+          path: source
+          persist-credentials: false
+
+      - name: Apply slim patches
+        run: python3 helper/scripts/et264_ultra/patch.py source
+
+      - name: Set up protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "35.1"
+          repo-token: ${{ github.token }}
+
+      - name: Set up Rust 1.95
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+
+      - name: cargo bloat top crates
+        working-directory: source
+        run: |
+          set -euo pipefail
+          cargo install cargo-bloat --locked --quiet || true
+          cargo bloat --profile mini --crates -n 40 -p easytier --bin easytier-core --no-default-features --features "websocket,tun,aes-gcm" 2>&1 | tail -70

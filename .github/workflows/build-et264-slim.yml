@@ -94,7 +94,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "variant=$VARIANT features=$FEATURES"
-          PATH="$PWD/musl_gcc/mipsel-unknown-linux-muslsf/bin:$PATH" RUSTC_BOOTSTRAP=1 cargo build --target "$TARGET" --profile mini -Z build-std=std -Z build-std-features=optimize_for_size -p easytier --bin easytier-core --no-default-features --features "$FEATURES" 2>&1 | tail -60
+          PATH="$PWD/musl_gcc/mipsel-unknown-linux-muslsf/bin:$PATH" RUSTC_BOOTSTRAP=1 cargo build --target "$TARGET" --profile mini -Z build-std=std,panic_abort -Z build-std-features=optimize_for_size -p easytier --bin easytier-core --no-default-features --features "$FEATURES" 2>&1 | tail -80
 
       - name: Inspect binary
         working-directory: source

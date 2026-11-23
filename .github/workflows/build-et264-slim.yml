@@ -1,0 +1,160 @@
+name: Build EasyTier 2.6.4 slim (mipsel, ws+tcp+udp only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: "a"
+            features: "websocket,tun"
+          - variant: "b"
+            features: "websocket,tun,zstd"
+          - variant: "c"
+            features: "websocket,tun,zstd,smoltcp"
+    env:
+      TARGET: mipsel-unknown-linux-musl
+      FEATURES: ${{ matrix.features }}
+      VARIANT: ${{ matrix.variant }}
+    steps:
+      - name: Check out EasyTier v2.6.4
+        uses: actions/checkout@v4
+        with:
+          repository: EasyTier/EasyTier
+          ref: v2.6.4
+          path: source
+          persist-credentials: false
+
+      - name: Add slim profile to workspace Cargo.toml
+        working-directory: source
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          p = 'Cargo.toml'
+          s = open(p, encoding='utf-8').read()
+          assert '[profile.mini]' not in s, 'profile.mini already exists'
+          s += '''
+[profile.mini]
+inherits = "release"
+opt-level = "z"
+'''
+          open(p, 'w', encoding='utf-8').write(s)
+          print('added [profile.mini]')
+          PY
+          tail -6 Cargo.toml
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -qqy build-essential mold musl-tools
+
+      - name: Set up protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "35.1"
+          repo-token: ${{ github.token }}
+
+      - name: Set up Rust 1.95 (with rust-src for build-std)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+          components: rust-src
+
+      - name: Set up MIPS (mipsel) cross toolchain
+        working-directory: source
+        run: |
+          set -euo pipefail
+          musl_target="mipsel-unknown-linux-muslsf"
+          archive="${musl_target}.tar.xz"
+          archive_sha=36d8b864b3f6d27558d3f19695a4a39b79a873086edc60bebf733777df2b8359
+          mkdir -p musl_gcc
+          wget --inet4-only -q \
+            "https://github.com/cross-tools/musl-cross/releases/download/20250520/$archive" \
+            -P musl_gcc/
+          echo "$archive_sha  musl_gcc/$archive" | sha256sum --check --strict
+          tar xf "musl_gcc/$archive" -C musl_gcc/
+          chmod -R u+w "musl_gcc/$musl_target"
+          echo "$PWD/musl_gcc/$musl_target/bin" >> "$GITHUB_PATH"
+          ln -sfn "$PWD/musl_gcc/$musl_target/$musl_target/sysroot" musl_gcc/sysroot
+          echo "BINDGEN_EXTRA_CLANG_ARGS=--sysroot=$PWD/musl_gcc/$musl_target/$musl_target/sysroot" >> "$GITHUB_ENV"
+          gcc_dir="musl_gcc/$musl_target/lib/gcc/$musl_target/15.1.0"
+          cp "$gcc_dir/libgcc_eh.a" "$gcc_dir/libunwind.a"
+          (
+            cd "$gcc_dir"
+            ar x libgcc.a _ctzsi2.o _clz.o _bswapsi2.o
+            ar rcs libctz.a _ctzsi2.o _clz.o _bswapsi2.o
+          )
+
+      - name: Build easytier-core (slim ${{ matrix.variant }})
+        working-directory: source
+        run: |
+          set -euo pipefail
+          echo "===== variant=$VARIANT features=$FEATURES ====="
+          PATH="$PWD/musl_gcc/mipsel-unknown-linux-muslsf/bin:$PATH" \
+          RUSTC_BOOTSTRAP=1 \
+          cargo build \
+            --target "$TARGET" \
+            --profile mini \
+            -Z build-std=std \
+            -Z build-std-features=optimize_for_size \
+            -p easytier \
+            --bin easytier-core \
+            --no-default-features \
+            --features "$FEATURES" 2>&1 | tail -80
+
+      - name: Inspect binary
+        working-directory: source
+        run: |
+          set -euo pipefail
+          BIN="target/$TARGET/mini/easytier-core"
+          if [ ! -f "$BIN" ]; then echo "BUILD FAILED - no binary"; exit 1; fi
+          echo "===== SIZE (variant $VARIANT / $FEATURES) ====="
+          wc -c "$BIN"
+          du -h "$BIN"
+          echo "===== file type ====="
+          file "$BIN" || true
+          echo "===== protocol strings ====="
+          strings "$BIN" | grep -oiE '^(ws|wss|tcp|udp|kcp|quic|wg)://' | sort -u || true
+          echo "===== banned protocols presence check ====="
+          for kw in kcp quic wireguard boringtun; do
+            echo -n "  $kw: "; strings "$BIN" | grep -ic "$kw" || true
+          done
+
+      - name: Package and publish release
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BIN="target/$TARGET/mini/easytier-core"
+          mkdir -p package
+          OUT="easytier264-slim-$VARIANT-mipsel"
+          cp "$BIN" "package/$OUT"
+          chmod +x "package/$OUT"
+          gzip -9 -c "package/$OUT" > "package/$OUT.gz"
+          sha256sum "package/$OUT" "package/$OUT.gz" || true
+          ls -l package/
+          cd package
+          TAG="et264-slim-$VARIANT-$(date +%s)"
+          SIZE=$(wc -c < "$OUT")
+          gh release create "$TAG" "$OUT.gz" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "EasyTier 2.6.4 slim [$VARIANT] $SIZE bytes" \
+            --notes "EasyTier v2.6.4 easytier-core, mipsel musl static, profile mini (opt-level=z, lto, strip).
+Features: $FEATURES
+No kcp / quic / wireguard. No UPX.
+Raw size: $SIZE bytes. gunzip to get $OUT."
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "Created release $TAG (raw size $SIZE)"

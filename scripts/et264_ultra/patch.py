@@ -17,6 +17,7 @@ root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "source")
 here = pathlib.Path(__file__).resolve().parent
 nowss = os.environ.get("NOWSS") == "1"
 fmtdebug = os.environ.get("FMTDEBUG") == "1"
+aborts = os.environ.get("ABORT") == "1"
 
 
 def read(rel):
@@ -166,17 +167,24 @@ marker = (
 if marker not in text:
     sys.exit("PATCH FAILED [cargo-config-marker]")
 extra = '    "-C",\n    "link-arg=-Wl,--gc-sections",\n'
+if aborts:
+    # Rust 1.95 turned immediate-abort into a real panic strategy; rustc needs
+    # -Z unstable-options present at the crate level for that value.
+    extra += '    "-Z",\n    "unstable-options",\n'
 if fmtdebug:
     extra += '    "-Z",\n    "fmt-debug=none",\n'
 cfg.write_text(text.replace(marker, marker + extra, 1))
-print(f"patched [cargo-config-rustflags] fmtdebug={fmtdebug}")
+print(f"patched [cargo-config-rustflags] fmtdebug={fmtdebug} abort={aborts}")
 
 # ---------------------------------------------------------------- mini profile
 ws = pathlib.Path(root / "Cargo.toml")
 wtext = ws.read_text()
 if "profile.mini" not in wtext:
-    ws.write_text(wtext + '\n[profile.mini]\ninherits = "release"\nopt-level = "z"\n')
-    print("added [profile.mini]")
+    block = '\n[profile.mini]\ninherits = "release"\nopt-level = "z"\n'
+    if aborts:
+        block += 'panic = "immediate-abort"\n'
+    ws.write_text(wtext + block)
+    print(f"added [profile.mini] abort={aborts}")
 else:
     print("[profile.mini] already present")
 

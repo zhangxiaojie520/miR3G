@@ -1,5 +1,4 @@
-name: Build EasyTier 2.6.4 slim (mipsel, ws+tcp+udp only)
-
+name: Build EasyTier 2.6.4 slim mipsel
 on:
   workflow_dispatch:
 
@@ -18,12 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - variant: "a"
-            features: "websocket,tun"
-          - variant: "b"
-            features: "websocket,tun,zstd"
-          - variant: "c"
-            features: "websocket,tun,zstd,smoltcp"
+          - variant: a
+            features: websocket,tun
+          - variant: b
+            features: websocket,tun,zstd
+          - variant: c
+            features: websocket,tun,zstd,smoltcp
     env:
       TARGET: mipsel-unknown-linux-musl
       FEATURES: ${{ matrix.features }}
@@ -41,19 +40,14 @@ jobs:
         working-directory: source
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          p = 'Cargo.toml'
-          s = open(p, encoding='utf-8').read()
-          assert '[profile.mini]' not in s, 'profile.mini already exists'
-          s += '''
-[profile.mini]
-inherits = "release"
-opt-level = "z"
-'''
-          open(p, 'w', encoding='utf-8').write(s)
-          print('added [profile.mini]')
-          PY
-          tail -6 Cargo.toml
+          if grep -q 'profile.mini' Cargo.toml; then
+            echo "profile.mini already present, skip"
+          else
+            printf '\n[profile.mini]\ninherits = "release"\nopt-level = "z"\n' >> Cargo.toml
+            echo "added profile.mini"
+          fi
+          echo "----- tail Cargo.toml -----"
+          tail -8 Cargo.toml
 
       - name: Install build dependencies
         run: |
@@ -66,13 +60,13 @@ opt-level = "z"
           version: "35.1"
           repo-token: ${{ github.token }}
 
-      - name: Set up Rust 1.95 (with rust-src for build-std)
+      - name: Set up Rust 1.95 with rust-src
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95"
           components: rust-src
 
-      - name: Set up MIPS (mipsel) cross toolchain
+      - name: Set up mipsel cross toolchain
         working-directory: source
         run: |
           set -euo pipefail
@@ -80,9 +74,7 @@ opt-level = "z"
           archive="${musl_target}.tar.xz"
           archive_sha=36d8b864b3f6d27558d3f19695a4a39b79a873086edc60bebf733777df2b8359
           mkdir -p musl_gcc
-          wget --inet4-only -q \
-            "https://github.com/cross-tools/musl-cross/releases/download/20250520/$archive" \
-            -P musl_gcc/
+          wget --inet4-only -q "https://github.com/cross-tools/musl-cross/releases/download/20250520/$archive" -P musl_gcc/
           echo "$archive_sha  musl_gcc/$archive" | sha256sum --check --strict
           tar xf "musl_gcc/$archive" -C musl_gcc/
           chmod -R u+w "musl_gcc/$musl_target"
@@ -97,39 +89,32 @@ opt-level = "z"
             ar rcs libctz.a _ctzsi2.o _clz.o _bswapsi2.o
           )
 
-      - name: Build easytier-core (slim ${{ matrix.variant }})
+      - name: Build easytier-core
         working-directory: source
         run: |
           set -euo pipefail
-          echo "===== variant=$VARIANT features=$FEATURES ====="
-          PATH="$PWD/musl_gcc/mipsel-unknown-linux-muslsf/bin:$PATH" \
-          RUSTC_BOOTSTRAP=1 \
-          cargo build \
-            --target "$TARGET" \
-            --profile mini \
-            -Z build-std=std \
-            -Z build-std-features=optimize_for_size \
-            -p easytier \
-            --bin easytier-core \
-            --no-default-features \
-            --features "$FEATURES" 2>&1 | tail -80
+          echo "variant=$VARIANT features=$FEATURES"
+          PATH="$PWD/musl_gcc/mipsel-unknown-linux-muslsf/bin:$PATH" RUSTC_BOOTSTRAP=1 cargo build --target "$TARGET" --profile mini -Z build-std=std -Z build-std-features=optimize_for_size -p easytier --bin easytier-core --no-default-features --features "$FEATURES" 2>&1 | tail -60
 
       - name: Inspect binary
         working-directory: source
         run: |
           set -euo pipefail
           BIN="target/$TARGET/mini/easytier-core"
-          if [ ! -f "$BIN" ]; then echo "BUILD FAILED - no binary"; exit 1; fi
-          echo "===== SIZE (variant $VARIANT / $FEATURES) ====="
+          if [ ! -f "$BIN" ]; then
+            echo "BUILD FAILED - binary not found"
+            exit 1
+          fi
+          echo "===== SIZE variant $VARIANT features $FEATURES ====="
           wc -c "$BIN"
           du -h "$BIN"
-          echo "===== file type ====="
           file "$BIN" || true
-          echo "===== protocol strings ====="
+          echo "===== protocol scheme strings ====="
           strings "$BIN" | grep -oiE '^(ws|wss|tcp|udp|kcp|quic|wg)://' | sort -u || true
-          echo "===== banned protocols presence check ====="
+          echo "===== banned protocol mention counts ====="
           for kw in kcp quic wireguard boringtun; do
-            echo -n "  $kw: "; strings "$BIN" | grep -ic "$kw" || true
+            cnt=$(strings "$BIN" | grep -ic "$kw" || true)
+            echo "  $kw: $cnt"
           done
 
       - name: Package and publish release
@@ -146,15 +131,8 @@ opt-level = "z"
           gzip -9 -c "package/$OUT" > "package/$OUT.gz"
           sha256sum "package/$OUT" "package/$OUT.gz" || true
           ls -l package/
+          SIZE=$(wc -c < "package/$OUT")
           cd package
           TAG="et264-slim-$VARIANT-$(date +%s)"
-          SIZE=$(wc -c < "$OUT")
-          gh release create "$TAG" "$OUT.gz" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "EasyTier 2.6.4 slim [$VARIANT] $SIZE bytes" \
-            --notes "EasyTier v2.6.4 easytier-core, mipsel musl static, profile mini (opt-level=z, lto, strip).
-Features: $FEATURES
-No kcp / quic / wireguard. No UPX.
-Raw size: $SIZE bytes. gunzip to get $OUT."
-          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
-          echo "Created release $TAG (raw size $SIZE)"
+          gh release create "$TAG" "$OUT.gz" --repo "$GITHUB_REPOSITORY" --title "EasyTier 2.6.4 slim $VARIANT - $SIZE bytes" --notes "EasyTier v2.6.4 easytier-core, mipsel musl static, profile mini opt-level=z lto strip. Features: $FEATURES. No kcp quic wireguard. No UPX. Raw size $SIZE bytes."
+          echo "created release $TAG raw=$SIZE"

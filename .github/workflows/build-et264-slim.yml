@@ -17,12 +17,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - variant: a
-            features: websocket,tun
-          - variant: b
-            features: websocket,tun,zstd
-          - variant: c
-            features: websocket,tun,zstd,smoltcp
+          - variant: d
+            features: websocket,tun,aes-gcm
+          - variant: e
+            features: websocket,tun,aes-gcm,zstd
     env:
       TARGET: mipsel-unknown-linux-musl
       FEATURES: ${{ matrix.features }}

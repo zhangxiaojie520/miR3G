@@ -17,29 +17,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - variant: s2
-            abort: modern
-            nowss: "0"
-            fmtdebug: "0"
-          - variant: s3
-            abort: modern
-            nowss: "1"
-            fmtdebug: "0"
-          - variant: s4
+          - variant: z1
             abort: modern
             nowss: "1"
             fmtdebug: "1"
-          - variant: s5
-            abort: legacy
-            nowss: "0"
-            fmtdebug: "0"
-          - variant: s6
-            abort: legacy
+            features: "websocket,tun,aes-gcm,zstd"
+          - variant: z2
+            abort: modern
             nowss: "1"
             fmtdebug: "1"
+            features: "websocket,tun,aes-gcm,zstd,smoltcp"
     env:
       TARGET: mipsel-unknown-linux-musl
-      FEATURES: websocket,tun,aes-gcm
+      FEATURES: ${{ matrix.features }}
       VARIANT: ${{ matrix.variant }}
       ABORT: ${{ matrix.abort }}
       NOWSS: ${{ matrix.nowss }}

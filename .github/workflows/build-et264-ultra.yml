@@ -113,14 +113,15 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$ABORT" = "1" ]; then
-            STD_FEATURES="optimize_for_size,panic_immediate_abort"
+            EXTRA_FLAGS="-Z unstable-options"
           else
-            STD_FEATURES="optimize_for_size"
+            EXTRA_FLAGS=""
           fi
-          echo "variant=$VARIANT features=$FEATURES abort=$ABORT nowss=$NOWSS fmtdebug=$FMTDEBUG std=$STD_FEATURES"
+          echo "variant=$VARIANT features=$FEATURES abort=$ABORT nowss=$NOWSS fmtdebug=$FMTDEBUG"
+          grep -n -A6 'profile.mini' Cargo.toml || true
           PATH="$PWD/musl_gcc/mipsel-unknown-linux-muslsf/bin:$PATH" RUSTC_BOOTSTRAP=1 \
-            cargo build --target "$TARGET" --profile mini \
-            -Z build-std=std,panic_abort -Z build-std-features="$STD_FEATURES" \
+            cargo build $EXTRA_FLAGS --target "$TARGET" --profile mini \
+            -Z build-std=std,panic_abort -Z build-std-features=optimize_for_size \
             -p easytier --bin easytier-core --no-default-features --features "$FEATURES" 2>&1 | tail -120
 
       - name: Inspect binary
@@ -191,6 +192,11 @@ jobs:
 
       - name: Apply slim patches
         run: python3 helper/scripts/et264_ultra/patch.py source
+
+      - name: Install mold for host link
+        run: |
+          sudo apt-get update
+          sudo apt-get install -qqy mold build-essential
 
       - name: Set up protoc
         uses: arduino/setup-protoc@v3

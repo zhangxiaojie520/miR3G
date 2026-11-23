@@ -1,4 +1,4 @@
-name: Build easytier-mini + WebSocket (mipsel) [TEST]
+name: Build easytier-mini + WebSocket v2 (mipsel, ws endpoint enabled)
 
 on:
   workflow_dispatch:
@@ -37,10 +37,27 @@ jobs:
           assert old in s, 'anchor not found; Cargo.toml layout changed'
           s = s.replace(old, new, 1)
           open(p, 'w', encoding='utf-8').write(s)
-          print('patched OK')
+          print('patched Cargo.toml OK')
           PY
           echo '===== patched mini Cargo.toml ====='
           cat easytier-contrib/easytier-mini/Cargo.toml
+
+      - name: Patch compact host config to allow ws/wss endpoint protocols
+        working-directory: source
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          p = 'easytier/src/instance/config.rs'
+          s = open(p, encoding='utf-8').read()
+          old = 'config.endpoint_protocols = vec!["tcp".to_owned(), "udp".to_owned()];'
+          new = 'config.endpoint_protocols = vec!["tcp".to_owned(), "udp".to_owned(), "ws".to_owned(), "wss".to_owned()];'
+          assert s.count(old) == 1, 'endpoint_protocols anchor count != 1'
+          s = s.replace(old, new, 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('patched compact endpoint_protocols OK')
+          PY
+          echo '===== patched config.rs line ====='
+          grep -n 'endpoint_protocols' easytier/src/instance/config.rs
 
       - name: Install build dependencies
         run: |
@@ -121,7 +138,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="ws-mini-test-$(date +%s)"
+          TAG="ws-mini-v2-$(date +%s)"
           gh release create "$TAG" \
             easytier-mini-ws-mipsel.gz \
             --repo "$GITHUB_REPOSITORY" \

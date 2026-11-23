@@ -17,20 +17,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - variant: s1
-            abort: "0"
-            nowss: "0"
-            fmtdebug: "0"
           - variant: s2
-            abort: "1"
+            abort: modern
             nowss: "0"
             fmtdebug: "0"
           - variant: s3
-            abort: "1"
+            abort: modern
             nowss: "1"
             fmtdebug: "0"
           - variant: s4
-            abort: "1"
+            abort: modern
+            nowss: "1"
+            fmtdebug: "1"
+          - variant: s5
+            abort: legacy
+            nowss: "0"
+            fmtdebug: "0"
+          - variant: s6
+            abort: legacy
             nowss: "1"
             fmtdebug: "1"
     env:
@@ -112,16 +116,19 @@ jobs:
         working-directory: source
         run: |
           set -euo pipefail
-          if [ "$ABORT" = "1" ]; then
-            EXTRA_FLAGS="-Z unstable-options"
-          else
-            EXTRA_FLAGS=""
+          CARGO_EXTRA=""
+          STD_FEATURES="optimize_for_size"
+          if [ "$ABORT" = "modern" ]; then
+            CARGO_EXTRA="-Z unstable-options"
+          elif [ "$ABORT" = "legacy" ]; then
+            STD_FEATURES="optimize_for_size,panic_immediate_abort"
           fi
-          echo "variant=$VARIANT features=$FEATURES abort=$ABORT nowss=$NOWSS fmtdebug=$FMTDEBUG"
+          echo "variant=$VARIANT features=$FEATURES abort=$ABORT nowss=$NOWSS fmtdebug=$FMTDEBUG std=$STD_FEATURES"
           grep -n -A6 'profile.mini' Cargo.toml || true
+          head -3 Cargo.toml
           PATH="$PWD/musl_gcc/mipsel-unknown-linux-muslsf/bin:$PATH" RUSTC_BOOTSTRAP=1 \
-            cargo build $EXTRA_FLAGS --target "$TARGET" --profile mini \
-            -Z build-std=std,panic_abort -Z build-std-features=optimize_for_size \
+            cargo build $CARGO_EXTRA --target "$TARGET" --profile mini \
+            -Z build-std=std,panic_abort -Z build-std-features="$STD_FEATURES" \
             -p easytier --bin easytier-core --no-default-features --features "$FEATURES" 2>&1 | tail -120
 
       - name: Inspect binary

@@ -4,8 +4,10 @@
 Usage: python3 patch.py <source-root>
 
 Env:
-  NOWSS=1     drop wss/TLS support (rustls, tokio-rustls, webpki-roots, rcgen)
-  FMTDEBUG=1  add -Z fmt-debug=none to target rustflags
+  NOWSS=1         drop wss/TLS support (rustls, tokio-rustls, webpki-roots, rcgen)
+  FMTDEBUG=1      add -Z fmt-debug=none to target rustflags
+  ABORT=modern    profile panic = "immediate-abort" + cargo-features opt-in
+  ABORT=legacy    profile panic = "abort" only (std feature set by the workflow)
 
 Every textual replacement is asserted: a missing pattern aborts the build.
 """
@@ -17,7 +19,10 @@ root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "source")
 here = pathlib.Path(__file__).resolve().parent
 nowss = os.environ.get("NOWSS") == "1"
 fmtdebug = os.environ.get("FMTDEBUG") == "1"
-aborts = os.environ.get("ABORT") == "1"
+abort_mode = os.environ.get("ABORT", "0")
+if abort_mode == "1":  # backwards compatibility
+    abort_mode = "modern"
+aborts = abort_mode in ("modern", "legacy")
 
 
 def read(rel):
@@ -167,25 +172,29 @@ marker = (
 if marker not in text:
     sys.exit("PATCH FAILED [cargo-config-marker]")
 extra = '    "-C",\n    "link-arg=-Wl,--gc-sections",\n'
-if aborts:
+if abort_mode == "modern":
     # Rust 1.95 turned immediate-abort into a real panic strategy; rustc needs
     # -Z unstable-options present at the crate level for that value.
     extra += '    "-Z",\n    "unstable-options",\n'
 if fmtdebug:
     extra += '    "-Z",\n    "fmt-debug=none",\n'
 cfg.write_text(text.replace(marker, marker + extra, 1))
-print(f"patched [cargo-config-rustflags] fmtdebug={fmtdebug} abort={aborts}")
+print(f"patched [cargo-config-rustflags] fmtdebug={fmtdebug} abort={abort_mode}")
 
 # ---------------------------------------------------------------- mini profile
 ws = pathlib.Path(root / "Cargo.toml")
 wtext = ws.read_text()
+if abort_mode == "modern" and "cargo-features" not in wtext:
+    wtext = 'cargo-features = ["panic-immediate-abort"]\n\n' + wtext
+    print("prepended cargo-features = panic-immediate-abort")
 if "profile.mini" not in wtext:
     block = '\n[profile.mini]\ninherits = "release"\nopt-level = "z"\n'
-    if aborts:
+    if abort_mode == "modern":
         block += 'panic = "immediate-abort"\n'
-    ws.write_text(wtext + block)
-    print(f"added [profile.mini] abort={aborts}")
-else:
-    print("[profile.mini] already present")
+    elif abort_mode == "legacy":
+        block += 'panic = "abort"\n'
+    wtext = wtext + block
+    print(f"added [profile.mini] abort={abort_mode}")
+ws.write_text(wtext)
 
 print("ALL PATCHES APPLIED")

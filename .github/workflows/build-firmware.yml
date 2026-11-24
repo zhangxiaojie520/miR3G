@@ -1,0 +1,91 @@
+name: Build OpenWrt firmware with EasyTier z1 baked in
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout build assets
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libncurses5-dev zlib1g-dev \
+            gawk git gettext libssl-dev xsltproc wget unzip python3 curl file
+
+      - name: Download ImageBuilder
+        run: |
+          curl -fsSL --retry 5 -o ib.tar.xz \
+            "https://downloads.openwrt.org/releases/23.05.5/targets/ramips/mt76x8/openwrt-imagebuilder-23.05.5-ramips-mt76x8.Linux-x86_64.tar.xz"
+          echo "5980bd2b70d8a18cca6407ea1984719536f2cc937bd2011c56e62f26c8ad9bfb7390  ib.tar.xz" | sha256sum -c -
+          tar -xf ib.tar.xz
+          rm -f ib.tar.xz
+
+      - name: Fetch z1 binary from release
+        run: |
+          IB=$(find . -maxdepth 1 -type d -name "openwrt-imagebuilder-*")
+          mkdir -p "$IB/files/usr/bin"
+          curl -fsSL --retry 5 -o "$IB/files/usr/bin/et-z1.gz" \
+            "https://github.com/zhangxiaojie520/miR3G/releases/download/et264-ultra-z1-1795466658/easytier264-ultra-z1-mipsel.gz"
+          gzip -d "$IB/files/usr/bin/et-z1.gz"
+          chmod +x "$IB/files/usr/bin/et-z1"
+          echo "=== z1 binary ==="
+          ls -lh "$IB/files/usr/bin/et-z1"
+          md5sum "$IB/files/usr/bin/et-z1"
+
+      - name: Stage firmware files
+        run: |
+          IB=$(find . -maxdepth 1 -type d -name "openwrt-imagebuilder-*")
+          # 把仓库里的 firmware-assets/ 内容覆盖进 ImageBuilder 的 files/（二进制已在上面就位）
+          cp -a firmware-assets/. "$IB/files/"
+          # 恢复二进制（cp 可能未覆盖，确保存在且可执行）
+          chmod +x "$IB/files/usr/bin/et-z1"
+          chmod +x "$IB/files/etc/init.d/et-z1" 2>/dev/null || true
+          chmod +x "$IB/files/etc/uci-defaults/99-et-z1" 2>/dev/null || true
+          chmod +x "$IB/files/www/cgi-bin/et" 2>/dev/null || true
+          echo "=== staged files tree ==="
+          find "$IB/files" -type f | sort
+
+      - name: Build image
+        working-directory: ${{ github.workspace }}
+        run: |
+          IB=$(find . -maxdepth 1 -type d -name "openwrt-imagebuilder-*")
+          cd "$IB"
+          # 精简包集：kmod-tun(组网必需) + uhttpd(CGI) + LuCI最小框架(显示菜单/页面)
+          # 不加完整 luci 全家桶，避免镜像超限
+          make image PROFILE="xiaomi_mi-router-4a-100m" \
+            PACKAGES="kmod-tun uhttpd luci-base luci-light luci-theme-bootstrap" \
+            FILES="files"
+          echo "=== built images ==="
+          ls -lh bin/targets/ramips/mt76x8/*.bin
+
+      - name: Verify image size
+        run: |
+          IB=$(find . -maxdepth 1 -type d -name "openwrt-imagebuilder-*")
+          IMG="$IB/bin/targets/ramips/mt76x8/openwrt-23.05.5-ramips-mt76x8-xiaomi_mi-router-4a-100m-squashfs-sysupgrade.bin"
+          SZ=$(stat -c%s "$IMG")
+          echo "sysupgrade size: $SZ bytes ($(echo "scale=2;$SZ/1048576"|bc) MB)"
+          echo "limit: 14976k = 15335424 bytes"
+          if [ "$SZ" -gt 15335424 ]; then
+            echo "ERROR: image too big"; exit 1
+          fi
+          echo "SIZE OK"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IB=$(find . -maxdepth 1 -type d -name "openwrt-imagebuilder-*")
+          IMG="$IB/bin/targets/ramips/mt76x8/openwrt-23.05.5-ramips-mt76x8-xiaomi_mi-router-4a-100m-squashfs-sysupgrade.bin"
+          cp "$IMG" et-z1-firmware-sysupgrade.bin
+          TIMESTAMP=$(date +%s)
+          gh release create "z1-firmware-$TIMESTAMP" et-z1-firmware-sysupgrade.bin \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "OpenWrt 23.05.5 + EasyTier z1 baked-in" \
+            --notes "Custom firmware: z1 binary in /usr/bin, config /etc/et-z1.toml, procd autostart, firewall et zone, LuCI app + standalone page. Fixed IP 10.126.126.6. Flash via Breed or LuCI sysupgrade."
+          echo "RELEASE_TAG=z1-firmware-$TIMESTAMP" >> $GITHUB_ENV

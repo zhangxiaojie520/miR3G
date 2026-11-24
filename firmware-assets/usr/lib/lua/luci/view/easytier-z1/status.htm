@@ -1,0 +1,114 @@
+<%+header%>
+<%+easytier-z1/css%>
+
+<div class="et-card">
+  <div class="et-head">
+    <h3 style="margin:0">EasyTier 运行状态 <span class="et-tag">z1 · mi4a</span></h3>
+    <span class="et-badge" id="etBadge"><span class="et-dot"></span><span id="etBadgeTxt">检测中</span></span>
+  </div>
+  <div class="et-hint" id="etHdr" style="margin:6px 0 16px">—</div>
+  <div class="et-kv">
+    <div class="et-metric"><div class="et-label">虚拟 IP</div><div class="et-val" id="fIp">—</div></div>
+    <div class="et-metric"><div class="et-label">运行时间</div><div class="et-val" id="fUp">—</div></div>
+    <div class="et-metric"><div class="et-label">内存占用</div><div class="et-val" id="fRss">—</div></div>
+    <div class="et-metric"><div class="et-label">进程 PID</div><div class="et-val" id="fPid">—</div></div>
+  </div>
+  <div class="et-kv" style="margin-top:12px">
+    <div class="et-metric"><div class="et-label">累计下载 (RX)</div><div class="et-val" id="fRx">—</div></div>
+    <div class="et-metric"><div class="et-label">累计上传 (TX)</div><div class="et-val" id="fTx">—</div></div>
+    <div class="et-metric"><div class="et-label">二进制大小</div><div class="et-val" id="fBin">—</div></div>
+    <div class="et-metric"><div class="et-label">可用内存</div><div class="et-val" id="fAvail">—</div></div>
+  </div>
+</div>
+
+<div class="et-card">
+  <h3>快捷操作</h3>
+  <div class="et-row">
+    <button class="et-btn primary" id="btnStart">启动</button>
+    <button class="et-btn danger" id="btnStop">停止</button>
+    <button class="et-btn" id="btnRestart">重启</button>
+    <button class="et-btn" id="btnRefresh">刷新</button>
+    <a class="et-btn primary" href="<%=url('admin/vpn/easytier/config')%>">参数配置</a>
+  </div>
+</div>
+
+<div class="et-card">
+  <h3>隧道路由 <span class="et-tag">tun0</span></h3>
+  <div id="etRoutes"><div class="et-hint">—</div></div>
+</div>
+
+<div class="et-card">
+  <h3>节点连通性 <span class="et-tag">每 8 秒自动检测</span></h3>
+  <div id="etNodes"></div>
+  <div class="et-row" style="margin-top:12px">
+    <input class="et-input" id="customIps" placeholder="自定义目标 IP，逗号分隔" style="flex:1;min-width:180px">
+    <button class="et-btn" id="btnPing">测试</button>
+  </div>
+</div>
+
+<div class="et-toast" id="etToast"></div>
+
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id)};
+  var API='/cgi-bin/et';
+  var NODES=[['10.126.126.1','小米3G'],['10.126.126.2','istoreos'],['10.126.126.3','红米手机'],['192.168.5.1','对端网关']];
+  var pingBusy=false,busy=false;
+
+  function toast(msg,ok){var d=document.createElement('div');d.className=ok?'ok':'err';d.textContent=msg;
+    $('etToast').appendChild(d);setTimeout(function(){d.remove()},4200)}
+  function api(path,opt){return fetch(path,opt).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json()})}
+  function fmtB(n){return n>=1048576?(n/1048576).toFixed(2)+' MB':Math.round(n/1024)+' KB'}
+  function fmtDur(s){if(!s)return '—';var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+    return h?h+'h '+m+'m':m?m+'m '+x+'s':x+'s'}
+  function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+  function paint(d){
+    var on=d.running, badge=$('etBadge');
+    badge.className='et-badge '+(on?'on':'off');
+    $('etBadgeTxt').textContent=on?'运行中':'已停止';
+    $('etHdr').textContent=d.tun_ip?('tun0 '+d.tun_ip):'无虚拟 IP';
+    $('fIp').textContent=d.tun_ip||'—'; $('fIp').className='et-val '+(d.tun_ip?'et-ok':'et-bad');
+    $('fUp').textContent=on?fmtDur(d.uptime):'—';
+    $('fRss').textContent=d.rss_kb?fmtB(d.rss_kb*1024):'—';
+    $('fPid').textContent=d.pid||'—';
+    $('fRx').textContent=fmtB(d.tun_rx||0); $('fTx').textContent=fmtB(d.tun_tx||0);
+    $('fBin').textContent=d.bin_size?fmtB(d.bin_size):'未部署';
+    var m=d.mem||{}; $('fAvail').textContent=m.avail?fmtB(m.avail*1024):'—';
+    var routes=(d.routes||'').split('\n').filter(Boolean);
+    $('etRoutes').innerHTML=routes.length?routes.map(function(r){return '<div class="et-route">'+esc(r)+'</div>'}).join(''):'<div class="et-hint">节点未启动或没有注入路由</div>';
+    $('btnStart').disabled=busy||on; $('btnStop').disabled=busy||!on; $('btnRestart').disabled=busy||!on;
+  }
+  function refresh(){return api(API+'?a=status').then(paint).catch(function(e){paint({running:false})})}
+
+  function buildNodes(){ $('etNodes').innerHTML=NODES.map(function(n){return '<div class="et-node" data-ip="'+n[0]+'"><span>'+n[0]+' <span style="color:var(--et-text2);font-size:11px">'+n[1]+'</span></span><span class="et-st w" data-st>等待</span></div>'}).join('') }
+  function setNode(ip,ok,ms){var el=document.querySelector('.et-node[data-ip="'+ip+'"] [data-st]');if(!el)return;
+    el.className='et-st '+(ok?'y':'n');el.textContent=ok?(ms?ms+' ms':'通'):'不通'}
+  function runPing(list){if(pingBusy)return;var tg=list||NODES.map(function(n){return n[0]});
+    if(!tg.length)return;pingBusy=true;
+    api(API+'?a=ping&targets='+tg.join(',')).then(function(d){d.results.forEach(function(r){setNode(r.ip,r.ok,r.ms)})})
+      .catch(function(){}).then(function(){pingBusy=false})}
+
+  function act(a,label){busy=true;['btnStart','btnStop','btnRestart'].forEach(function(i){$(i).disabled=true});
+    api(API+'?a=action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})})
+      .then(function(d){toast(d.message||label+'完成',d.ok)}).catch(function(e){toast(label+'失败:'+e.message,false)})
+      .then(function(){busy=false;setTimeout(function(){refresh();runPing()},1200)})}
+
+  $('btnStart').onclick=function(){act('start','启动')};
+  $('btnStop').onclick=function(){act('stop','停止')};
+  $('btnRestart').onclick=function(){act('restart','重启')};
+  $('btnRefresh').onclick=function(){refresh();runPing();toast('已刷新',true)};
+  $('btnPing').onclick=function(){var raw=$('customIps').value.split(',').map(function(s){return s.trim()}).filter(Boolean);
+    if(!raw.length)return toast('先填目标 IP',false);
+    raw.forEach(function(ip){if(!document.querySelector('.et-node[data-ip="'+ip+'"]')){
+      var d=document.createElement('div');d.className='et-node';d.setAttribute('data-ip',ip);
+      d.innerHTML='<span>'+ip+' <span style="color:var(--et-text2);font-size:11px">自定义</span></span><span class="et-st w" data-st>等待</span>';
+      $('etNodes').appendChild(d)}});
+    runPing(raw)};
+
+  buildNodes();refresh();runPing();
+  setInterval(function(){refresh()},4000);
+  setInterval(function(){runPing()},8000);
+})();
+</script>
+<%+footer%>

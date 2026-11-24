@@ -1,0 +1,56 @@
+name: Verify z1 firmware contents
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install squashfs tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq squashfs-tools binwalk file
+
+      - name: Download firmware
+        run: |
+          curl -fsSL --retry 5 -o fw.bin \
+            "https://github.com/zhangxiaojie520/miR3G/releases/download/z1-firmware-1795534299/et-z1-firmware-sysupgrade.bin"
+          ls -lh fw.bin
+
+      - name: Extract squashfs and verify files
+        run: |
+          # 找 squashfs 魔数 hsqs 的位置
+          OFF=$(grep -abo 'hsqs' fw.bin | head -1 | cut -d: -f1)
+          echo "squashfs magic offset: $OFF"
+          if [ -z "$OFF" ]; then echo "NO SQUASHFS FOUND"; exit 1; fi
+          tail -c +$((OFF+1)) fw.bin > rootfs.squashfs
+          mkdir -p extracted
+          unsquashfs -d extracted rootfs.squashfs
+          echo "=== 关键文件检查 ==="
+          FAIL=0
+          check() {
+            if [ -e "extracted/$1" ]; then
+              echo "  OK: $1"
+              [ -n "$2" ] && echo "      size: $(stat -c%s "extracted/$1")"
+            else
+              echo "  MISSING: $1"
+              FAIL=1
+            fi
+          }
+          check "usr/bin/et-z1" "size"
+          check "etc/et-z1.toml"
+          check "etc/init.d/et-z1"
+          check "etc/uci-defaults/99-et-z1"
+          check "www/cgi-bin/et"
+          check "www/et/index.html"
+          check "usr/lib/lua/luci/controller/easytier-z1.lua"
+          check "usr/lib/lua/luci/view/easytier-z1/status.htm"
+          echo "=== 内容抽查 ==="
+          echo "--- 固定IP ---";    grep -c "10.126.126.6" extracted/etc/et-z1.toml
+          echo "--- 自启respawn ---"; grep -c "respawn" extracted/etc/init.d/et-z1
+          echo "--- 防火墙zone ---";  grep -c "et_zone" extracted/etc/uci-defaults/99-et-z1
+          echo "--- CGI二进制路径 ---"; grep -c "/usr/bin/et-z1" extracted/www/cgi-bin/et
+          echo "--- z1 MD5 ---";     md5sum extracted/usr/bin/et-z1
+          if [ "$FAIL" -eq 1 ]; then echo "VERIFICATION FAILED"; exit 1; fi
+          echo "VERIFICATION OK"

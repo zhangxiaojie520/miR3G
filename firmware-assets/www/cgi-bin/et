@@ -1,0 +1,303 @@
+#!/bin/sh
+# z1 console — 路由器内置 CGI 后端（纯 ash + busybox，无 Python 依赖）
+# 部署到 /www/cgi-bin/et，由 uhttpd 以 CGI 方式调用。
+# 所有动作在本机执行（不再是 SSH 转发），因此配置/日志路径直接指向本机 /tmp。
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+BIN=/usr/bin/et-z1
+CONF=/etc/et-z1.toml
+PREV=/tmp/et-z1.prev
+LOG=/tmp/et-z1.log
+PNAME=et-z1
+BIN_SRC=/www/et/et-z1.bin          # 可选：持久化在 overlay 的二进制副本（默认不存在）
+
+# ---------- HTTP 输出 ----------
+hdr_json() {
+  printf 'Content-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+}
+
+# 把一段文本转义成 JSON 字符串（不含外层引号）
+# 在 awk 里剥掉 ANSI 转义序列(ESC[...m)与控制字符，再转义引号/反斜杠
+# busybox sed 不可靠支持 \033，故全部用 awk + sprintf("%c",27) 生成 ESC
+json_esc() {
+  awk 'BEGIN{ORS=""; ESC=sprintf("%c",27)}
+    {
+      # 删除 CSI 序列: ESC [ 参数字节 结束字母
+      gsub(ESC "\\[[0-9;?]*[A-Za-z]", "");
+      # 删除 OSC 序列: ESC ] ... BEL
+      gsub(ESC "\\][^\007]*\007", "");
+      gsub(ESC, "");                       # 剩余孤立 ESC
+      gsub(/\r$/, "");
+      gsub(/\\/,"\\\\"); gsub(/"/,"\\\"");
+      gsub(/\t/,"\\t");
+      # 删除其它 ASCII 控制字符 (<0x20，换行由记录分隔处理)
+      for (i=1;i<=8;i++)  gsub(sprintf("%c",i), "");
+      for (i=11;i<=12;i++) gsub(sprintf("%c",i), "");
+      for (i=14;i<=31;i++) gsub(sprintf("%c",i), "");
+      if (NR>1) printf "\\n";
+      printf "%s", $0
+    }'
+}
+
+# 供 api_log 复用：剥离 ANSI 的纯文本（保留换行），写到 stdout
+strip_ansi_text() {
+  awk 'BEGIN{ESC=sprintf("%c",27)}
+    { gsub(ESC "\\[[0-9;?]*[A-Za-z]", ""); gsub(ESC "\\][^\007]*\007", "");
+      gsub(ESC, ""); print }'
+}
+
+# 从 stdin 读取 POST body（uhttpd 通过 CONTENT_LENGTH + stdin 传入）
+read_body() {
+  local n=${CONTENT_LENGTH:-0}
+  [ "$n" -le 0 ] 2>/dev/null && { BODY=''; return; }
+  BODY=$(dd bs=1 count="$n" 2>/dev/null)
+}
+
+# 解析 QUERY_STRING 里的单个 key
+qget() {
+  local key="$1" raw="$QUERY_STRING" kv k v
+  local IFS='&'
+  for kv in $raw; do
+    k=${kv%%=*}; v=${kv#*=}
+    [ "$k" = "$key" ] && { printf '%s' "$v"; return; }
+  done
+  printf ''
+}
+
+url_decode() {
+  # busybox awk 无 strtonum；这里只需处理 IP 列表里可能出现的少量编码
+  printf '%s' "$1" | sed -e 's/+/ /g' -e 's/%2C/,/g' -e 's/%2c/,/g' -e 's/%20/ /g'
+}
+
+# ---------- 状态采集（本机命令） ----------
+STATUS_SCRIPT() {
+  echo "###PID"; pidof "$PNAME" 2>/dev/null || echo none
+  echo "###AGE"; p=$(pidof "$PNAME"); if [ -n "$p" ]; then st=$(awk '{print $22}' /proc/$p/stat 2>/dev/null); up=$(cut -d. -f1 /proc/uptime); [ -n "$st" ] && echo $(( up - st / 100 )) || echo 0; else echo 0; fi
+  echo "###IP"; ip -4 addr show tun0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\/[0-9]*\).*/\1/p' | head -1
+  echo "###ROUTES"; ip route 2>/dev/null | grep tun0 || echo none
+  echo "###MEM"; free 2>/dev/null | sed -n '2p'
+  echo "###RSS"; p=$(pidof "$PNAME"); [ -n "$p" ] && awk '/VmRSS/{print $2}' /proc/$p/status || echo 0
+  echo "###BIN"; ls -l "$BIN" 2>/dev/null | awk '{print $5}' || echo 0
+  echo "###CFG"; ls -l "$CONF" 2>/dev/null | awk '{print $5}' || echo 0
+  echo "###LISTEN"; netstat -tln 2>/dev/null | grep -c 11020
+  echo "###NETDEV"; grep tun0 /proc/net/dev 2>/dev/null | awk '{print $2, $10}'
+  echo "###LOG"; tail -n 3 "$LOG" 2>/dev/null || true
+  echo "###END"
+}
+
+num_of() {  # $1=内容 $2=字段序号
+  set -- $1
+  eval "echo \${$2:-0}" 2>/dev/null || echo 0
+}
+
+api_status() {
+  RAW=$(STATUS_SCRIPT)
+  sec() { printf '%s' "$RAW" | sed -n "/^###$1\$/,/^###/p" | sed '1d;$d'; }
+
+  pid_raw=$(sec PID); pid=$(printf '%s' "$pid_raw" | awk 'NF{print $1;exit}')
+  [ "$pid" = "none" ] && pid=''
+  age=$(sec AGE | awk 'NF{print $1;exit}'); [ -z "$age" ] && age=0
+  ip4=$(sec IP | awk 'NF{print $1;exit}')
+
+  memline=$(sec MEM)
+  total=0; used=0; avail=0
+  set -- $memline
+  [ $# -ge 7 ] && { total=$2; used=$3; avail=$7; }
+
+  routes=$(sec ROUTES | grep -v '^none$' | awk 'BEGIN{ORS=""}{if(NR>1)printf "\\n";printf "%s",$0}')
+  netdev=$(sec NETDEV); set -- $netdev; rx=${1:-0}; tx=${2:-0}
+  case "$rx" in ''|*[!0-9]*) rx=0;; esac
+  case "$tx" in ''|*[!0-9]*) tx=0;; esac
+  rss=$(sec RSS | awk 'NF{print $1;exit}'); [ -z "$rss" ] && rss=0
+  bs=$(sec BIN | awk 'NF{print $1;exit}'); [ -z "$bs" ] && bs=0
+  cs=$(sec CFG | awk 'NF{print $1;exit}'); [ -z "$cs" ] && cs=0
+  lsn=$(sec LISTEN | awk 'NF{print $1;exit}'); [ -z "$lsn" ] && lsn=0
+  logtail=$(sec LOG)
+
+  hdr_json
+  printf '{"online":true,"reachable":true,"running":%s,"pid":"%s","uptime":%s,' \
+    "$([ -n "$pid" ] && echo true || echo false)" "$pid" "$age"
+  printf '"tun_ip":"%s","routes":"%s","mem":{"total":%s,"used":%s,"free":0,"avail":%s},' \
+    "$ip4" "$routes" "$total" "$used" "$avail"
+  printf '"rss_kb":%s,"bin_size":%s,"conf_size":%s,"listener":%s,"tun_rx":%s,"tun_tx":%s,' \
+    "$rss" "$bs" "$cs" "$lsn" "$rx" "$tx"
+  printf '"log_tail":"%s","ts":%s}' "$(printf '%s' "$logtail" | json_esc)" "$(date +%s)"
+}
+
+api_config_get() {
+  text=$(cat "$CONF" 2>/dev/null || true)
+  hdr_json
+  printf '{"ok":true,"text":"%s","error":""}' "$(printf '%s' "$text" | json_esc)"
+}
+
+api_log() {
+  n=$(qget lines); case "$n" in ''|*[!0-9]*) n=120;; esac
+  [ "$n" -lt 20 ] && n=20; [ "$n" -gt 2000 ] && n=2000
+  text=$(tail -n "$n" "$LOG" 2>/dev/null || true)
+  [ -z "$text" ] && text='(暂无日志)'
+  hdr_json
+  printf '{"ok":true,"text":"%s","error":""}' "$(printf '%s' "$text" | json_esc)"
+}
+
+api_ping() {
+  raw=$(url_decode "$(qget targets)")
+  [ -z "$raw" ] && raw='10.126.126.1,10.126.126.2,10.126.126.3,192.168.5.1'
+  hdr_json
+  printf '{"ok":true,"results":['
+  first=1
+  oldifs=$IFS; IFS=','
+  for t in $raw; do
+    IFS=$oldifs
+    t=$(printf '%s' "$t" | tr -d ' \t\r\n')
+    case "$t" in
+      ''|*[!0-9.]*) continue;;
+    esac
+    o=$(ping -c 2 -W 2 "$t" 2>/dev/null)
+    if [ $? -eq 0 ]; then
+      ms=$(printf '%s' "$o" | sed -n 's/.*round-trip[^=]*= [0-9.]*\/\([0-9.]*\)\/.*/\1/p' | head -1)
+      [ $first -eq 0 ] && printf ','
+      printf '{"ip":"%s","ok":true,"ms":"%s"}' "$t" "$ms"
+    else
+      [ $first -eq 0 ] && printf ','
+      printf '{"ip":"%s","ok":false,"ms":""}' "$t"
+    fi
+    first=0
+    IFS=','
+  done
+  IFS=$oldifs
+  printf ']}\n'
+}
+
+# ---------- 动作 ----------
+do_stop() {
+  for p in $(pidof "$PNAME" 2>/dev/null); do kill "$p" 2>/dev/null; done
+  sleep 2
+  pidof "$PNAME" >/dev/null 2>&1 && echo busy || echo none
+}
+
+do_start() {
+  mkdir -p "$(dirname "$LOG")"
+  # 子 shell 后台启动（与原先 SSH 方式一致，实测不会被回收）
+  ( cd /tmp && "$BIN" "$CONF" >"$LOG" 2>&1 & )
+  sleep 2
+  pidof "$PNAME" 2>/dev/null | awk '{print $1;exit}'
+}
+
+do_restart() {
+  do_stop >/dev/null 2>&1
+  sleep 1
+  do_start
+}
+
+health_check() {
+  # 进程活着 + tun0 有 IP + 至少一个对端可达
+  local timeout=${1:-15} end=$(( $(date +%s) + ${1:-15} )) out=''
+  while [ "$(date +%s)" -lt "$end" ]; do
+    p=$(pidof "$PNAME" 2>/dev/null)
+    [ -z "$p" ] && { out='NO-PROC'; sleep 1; continue; }
+    addr=$(ip -4 addr show tun0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)
+    [ -z "$addr" ] && { out='NO-IP'; sleep 1; continue; }
+    for t in 10.126.126.1 10.126.126.2 10.126.126.3; do
+      if ping -c 1 -W 1 "$t" >/dev/null 2>&1; then echo "OK $p $addr"; return 0; fi
+    done
+    out='NO-PEER'; sleep 1
+  done
+  echo "${out:-TIMEOUT}"
+  return 1
+}
+
+json_result() {  # $1=ok(true/false) $2=message $3=restored_text(可选)
+  hdr_json
+  if [ -n "$3" ]; then
+    printf '{"ok":%s,"message":"%s","restored_text":"%s"}' \
+      "$1" "$(printf '%s' "$2" | json_esc)" "$(printf '%s' "$3" | json_esc)"
+  else
+    printf '{"ok":%s,"message":"%s"}' "$1" "$(printf '%s' "$2" | json_esc)"
+  fi
+}
+
+api_action() {
+  read_body
+  act=$(printf '%s' "$BODY" | sed -n 's/.*"action"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  [ -z "$act" ] && act=$BODY   # 兼容纯文本
+  act=$(printf '%s' "$act" | tr -d ' \t\r\n')
+  case "$act" in
+    stop)
+      r=$(do_stop); [ "$r" = none ] && json_result true '已停止' || json_result false "停止失败：$r"
+      ;;
+    start)
+      r=$(do_start); [ -n "$r" ] && json_result true "已启动，PID $r" || json_result false '启动失败（检查二进制与配置）'
+      ;;
+    restart)
+      r=$(do_restart); [ -n "$r" ] && json_result true "已重启，PID $r" || json_result false '重启失败'
+      ;;
+    rollback)
+      [ -s "$PREV" ] || { json_result false '没有可回滚的配置'; return; }
+      cp "$PREV" "$CONF"
+      do_restart >/dev/null 2>&1
+      hc=$(health_check 12)
+      case "$hc" in OK*) json_result true '已回滚到上一份可用配置';; *) json_result false "已回滚但健康检查仍失败：$hc";; esac
+      ;;
+    *)
+      json_result false "未知动作：$act"
+      ;;
+  esac
+}
+
+api_config_post() {
+  read_body
+  # BODY 就是完整 TOML 文本（前端 text/plain 直传，避免 JSON 转义复杂度）
+  [ -z "$BODY" ] && { json_result false '配置为空'; return; }
+  old=$(cat "$CONF" 2>/dev/null || true)
+  printf '%s\n' "$BODY" > "$CONF"
+  restart=$(qget restart)
+  if [ "$restart" = 1 ]; then
+    [ -n "$old" ] && printf '%s\n' "$old" > "$PREV"
+    do_restart >/dev/null 2>&1
+    hc=$(health_check 15)
+    case "$hc" in
+      OK*) json_result true "配置已保存并应用，健康检查通过（$hc）" ;;
+      *)
+        if [ -n "$old" ]; then
+          printf '%s\n' "$old" > "$CONF"
+          do_restart >/dev/null 2>&1
+          hc2=$(health_check 12)
+          case "$hc2" in
+            OK*) json_result false "应用失败（$hc），已自动回滚到上一份配置，回滚后恢复正常" "$old" ;;
+            *) json_result false "应用失败（$hc），已回滚但回滚后仍异常（$hc2）" "$old" ;;
+          esac
+        else
+          json_result false "应用失败（$hc），且没有可回滚的备份"
+        fi
+        ;;
+    esac
+  else
+    json_result true '配置已保存（未重启，点击重启后生效）'
+  fi
+}
+
+api_deploy() {
+  # 若 overlay 里放了持久化副本 /www/et/et-z1.bin，则复制到 /tmp 并重启
+  if [ -s "$BIN_SRC" ]; then
+    cp "$BIN_SRC" "$BIN"; chmod +x "$BIN"
+    json_result true "已从内置副本恢复二进制 $(ls -l "$BIN" | awk '{print $5}') 字节；如需生效请重启"
+  else
+    json_result false "未找到内置二进制副本 $BIN_SRC（overlay 空间有限，需另行上传）"
+  fi
+}
+
+# ---------- 路由 ----------
+action=$(qget a)
+[ -z "$action" ] && action=status
+
+case "$action" in
+  status)       api_status ;;
+  config)       api_config_get ;;
+  log)          api_log ;;
+  ping)         api_ping ;;
+  action)       api_action ;;
+  config_post)  api_config_post ;;
+  deploy)       api_deploy ;;
+  *)            hdr_json; printf '{"error":"not found","a":"%s"}' "$action" ;;
+esac

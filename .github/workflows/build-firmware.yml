@@ -22,7 +22,10 @@ jobs:
         run: |
           curl -fsSL --retry 5 -o ib.tar.xz \
             "https://downloads.openwrt.org/releases/23.05.5/targets/ramips/mt76x8/openwrt-imagebuilder-23.05.5-ramips-mt76x8.Linux-x86_64.tar.xz"
-          echo "5980bd2b70d8a18cca6407ea1984719536f2cc937bd2011c56e62f26c8ad9bfb7390  ib.tar.xz" | sha256sum -c -
+          ACTUAL=$(sha256sum ib.tar.xz | awk '{print $1}')
+          EXPECT="5980bd2b70d8a18cca6407ea1984719536f2cc937bd2011c56e62f26c8ad9bfb7390"
+          echo "sha256 actual=$ACTUAL"
+          if [ "$ACTUAL" != "$EXPECT" ]; then echo "SHA256 MISMATCH"; exit 1; fi
           tar -xf ib.tar.xz
           rm -f ib.tar.xz
 

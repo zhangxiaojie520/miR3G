@@ -1,0 +1,129 @@
+<%+header%>
+<%+easytier-z1/css%>
+
+<div class="et-card">
+  <h3>EasyTier 参数配置 <span class="et-tag">保存并应用会做健康检查，失败自动回滚</span></h3>
+  <div class="et-tabs">
+    <button id="tabForm" class="active">表单设置</button>
+    <button id="tabSrc">配置文件 (TOML)</button>
+  </div>
+
+  <div id="formView">
+    <div class="et-grid">
+      <div class="et-field"><label>实例名称 (instance_name)</label><input class="et-input" id="cf_instance"></div>
+      <div class="et-field"><label>主机名 (hostname)</label><input class="et-input" id="cf_hostname"></div>
+      <div class="et-field"><label>虚拟 IP 地址 (ipv4)</label><input class="et-input" id="cf_ipv4" placeholder="10.126.126.6"></div>
+      <div class="et-field"><label>监听地址 (listeners，逗号分隔)</label><input class="et-input" id="cf_listeners" placeholder="tcp://0.0.0.0:11020, udp://0.0.0.0:11020"></div>
+    </div>
+    <div class="et-grid">
+      <div class="et-field"><label>网络名称 (network_name)</label><input class="et-input" id="cf_netname"></div>
+      <div class="et-field"><label>网络密码 (network_secret)</label><input class="et-input" id="cf_secret"></div>
+    </div>
+    <div class="et-field"><label class="et-chk"><input type="checkbox" id="cf_enc"> 启用加密 (enable_encryption) — 当前明文网络请取消勾选</label></div>
+    <div class="et-field"><label>代理网段 (proxy_network，每行一个 CIDR)</label><textarea class="et-area sm" id="cf_proxy"></textarea></div>
+    <div class="et-field"><label>对端节点 (peer，每行一个 URI)</label><textarea class="et-area sm" id="cf_peers"></textarea></div>
+  </div>
+
+  <div id="srcView" style="display:none">
+    <textarea class="et-area" id="cfg" spellcheck="false"></textarea>
+  </div>
+
+  <div class="et-row" style="margin-top:14px">
+    <button class="et-btn" id="btnSave">保存</button>
+    <button class="et-btn primary" id="btnSaveRestart">保存并应用</button>
+    <button class="et-btn" id="btnReload">重新读取</button>
+    <button class="et-btn danger" id="btnRollback">回滚</button>
+  </div>
+  <div class="et-hint">配置文件：<span style="font-family:var(--et-mono)">/tmp/et-z1.toml</span>　·　上一份可用配置自动备份，应用失败自动回滚</div>
+</div>
+
+<div class="et-toast" id="etToast"></div>
+
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id)};
+  var API='/cgi-bin/et';
+  function toast(msg,ok){var d=document.createElement('div');d.className=ok?'ok':'err';d.textContent=msg;
+    $('etToast').appendChild(d);setTimeout(function(){d.remove()},4800)}
+  function api(path,opt){return fetch(path,opt).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json()})}
+
+  function parseTOML(text){
+    var c={instance_name:'',hostname:'',ipv4:'',listeners:[],network_name:'',network_secret:'',enable_encryption:false,proxies:[],peers:[]};
+    var sec='';
+    text.split('\n').forEach(function(line){
+      var s=line.trim(),m;
+      if(s.charAt(0)==='['&&s.charAt(s.length-1)===']'){sec=s;return}
+      if((m=s.match(/^instance_name\s*=\s*"([^"]*)"/)))c.instance_name=m[1];
+      else if((m=s.match(/^hostname\s*=\s*"([^"]*)"/)))c.hostname=m[1];
+      else if((m=s.match(/^ipv4\s*=\s*"([^"]*)"/)))c.ipv4=m[1];
+      else if((m=s.match(/^listeners\s*=\s*\[([^\]]*)\]/))){var lm,arr=[];var re=/"([^"]*)"/g;
+        while((lm=re.exec(m[1]))!==null)arr.push(lm[1]);c.listeners=arr}
+      else if(sec==='[network_identity]'&&(m=s.match(/^network_name\s*=\s*"([^"]*)"/)))c.network_name=m[1];
+      else if(sec==='[network_identity]'&&(m=s.match(/^network_secret\s*=\s*"([^"]*)"/)))c.network_secret=m[1];
+      else if(sec==='[flags]'&&(m=s.match(/^enable_encryption\s*=\s*(true|false)/i)))c.enable_encryption=m[1].toLowerCase()==='true';
+      else if(sec==='[[proxy_network]]'&&(m=s.match(/^cidr\s*=\s*"([^"]*)"/)))c.proxies.push(m[1]);
+      else if(sec==='[[peer]]'&&(m=s.match(/^uri\s*=\s*"([^"]*)"/)))c.peers.push(m[1]);
+    });
+    return c;
+  }
+  function genTOML(c){
+    var L=[];
+    L.push('instance_name = "'+c.instance_name+'"');
+    L.push('hostname = "'+c.hostname+'"');
+    L.push('ipv4 = "'+c.ipv4+'"');
+    L.push('listeners = ['+c.listeners.map(function(x){return '"'+x+'"'}).join(', ')+']');
+    L.push('','[network_identity]');
+    L.push('network_name = "'+c.network_name+'"');
+    L.push('network_secret = "'+c.network_secret+'"');
+    L.push('','[flags]');
+    L.push('enable_encryption = '+c.enable_encryption);
+    L.push('');
+    c.proxies.forEach(function(p){L.push('[[proxy_network]]');L.push('cidr = "'+p+'"');L.push('')});
+    c.peers.forEach(function(p){L.push('[[peer]]');L.push('uri = "'+p+'"');L.push('')});
+    return L.join('\n').trim()+'\n';
+  }
+  function formToCfg(){return {
+    instance_name:$('cf_instance').value.trim(),hostname:$('cf_hostname').value.trim(),
+    ipv4:$('cf_ipv4').value.trim(),
+    listeners:$('cf_listeners').value.split(',').map(function(s){return s.trim()}).filter(Boolean),
+    network_name:$('cf_netname').value.trim(),network_secret:$('cf_secret').value.trim(),
+    enable_encryption:$('cf_enc').checked,
+    proxies:$('cf_proxy').value.split('\n').map(function(s){return s.trim()}).filter(Boolean),
+    peers:$('cf_peers').value.split('\n').map(function(s){return s.trim()}).filter(Boolean)
+  }}
+  function fillForm(text){var c=parseTOML(text);
+    $('cf_instance').value=c.instance_name;$('cf_hostname').value=c.hostname;$('cf_ipv4').value=c.ipv4;
+    $('cf_listeners').value=c.listeners.join(', ');$('cf_netname').value=c.network_name;
+    $('cf_secret').value=c.network_secret;$('cf_enc').checked=c.enable_encryption;
+    $('cf_proxy').value=c.proxies.join('\n');$('cf_peers').value=c.peers.join('\n')}
+  function currentText(){return $('tabSrc').classList.contains('active')?$('cfg').value:genTOML(formToCfg())}
+  function switchTab(which){
+    if(which==='src'){var t=genTOML(formToCfg());$('cfg').value=t;
+      $('formView').style.display='none';$('srcView').style.display='block';
+      $('tabSrc').classList.add('active');$('tabForm').classList.remove('active')}
+    else{var t2=$('cfg').value;fillForm(t2);
+      $('srcView').style.display='none';$('formView').style.display='block';
+      $('tabForm').classList.add('active');$('tabSrc').classList.remove('active')}
+  }
+  $('tabSrc').onclick=function(){switchTab('src')};$('tabForm').onclick=function(){switchTab('form')};
+
+  function loadCfg(){api(API+'?a=config').then(function(d){$('cfg').value=d.text||'';fillForm(d.text||'')})
+    .catch(function(e){toast('读取配置失败:'+e.message,false)})}
+  $('btnReload').onclick=loadCfg;
+
+  function save(restart){
+    var text=currentText();if(!text.trim())return toast('配置为空',false);
+    if(restart)toast('正在应用配置并做健康检查（约 10 秒）…',true);
+    api(API+'?a=config_post'+(restart?'&restart=1':''),{method:'POST',headers:{'Content-Type':'text/plain'},body:text})
+      .then(function(d){toast(d.message,d.ok);if(d.restored_text){$('cfg').value=d.restored_text;fillForm(d.restored_text)};return d})
+      .catch(function(e){toast('保存失败:'+e.message,false)});
+  }
+  $('btnSave').onclick=function(){save(false)};$('btnSaveRestart').onclick=function(){save(true)};
+  $('btnRollback').onclick=function(){
+    api(API+'?a=action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'rollback'})})
+      .then(function(d){toast(d.message,d.ok);loadCfg()}).catch(function(e){toast('回滚失败:'+e.message,false)})};
+
+  loadCfg();
+})();
+</script>
+<%+footer%>

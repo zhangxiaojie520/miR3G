@@ -1,0 +1,34 @@
+<%+header%>
+<%+easytier-z1/css%>
+
+<div class="et-card">
+  <h3>运行日志 <span class="et-tag">/tmp/et-z1.log · 尾部 200 行</span></h3>
+  <div class="et-row" style="margin-bottom:12px">
+    <label class="et-chk"><input type="checkbox" id="autoLog" checked> 自动刷新（每 3 秒）</label>
+    <button class="et-btn" id="btnRefresh">立即刷新</button>
+  </div>
+  <pre class="et-log" id="etLog">正在加载日志…</pre>
+</div>
+
+<div class="et-toast" id="etToast"></div>
+
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id)};
+  var API='/cgi-bin/et';
+  function toast(msg,ok){var d=document.createElement('div');d.className=ok?'ok':'err';d.textContent=msg;
+    $('etToast').appendChild(d);setTimeout(function(){d.remove()},3600)}
+  function api(path){return fetch(path).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json()})}
+  function pull(){
+    if(!$('autoLog').checked)return;
+    api(API+'?a=log&lines=200').then(function(d){
+      var pre=$('etLog');var atBottom=pre.scrollTop+pre.clientHeight>=pre.scrollHeight-30;
+      pre.textContent=d.text||'(暂无日志)';if(atBottom)pre.scrollTop=pre.scrollHeight;
+    }).catch(function(e){$('etLog').textContent='读取日志失败:'+e.message})
+  }
+  $('btnRefresh').onclick=function(){pull();toast('已刷新',true)};
+  pull();
+  setInterval(pull,3000);
+})();
+</script>
+<%+footer%>

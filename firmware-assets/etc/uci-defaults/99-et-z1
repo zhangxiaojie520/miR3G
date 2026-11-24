@@ -1,0 +1,39 @@
+#!/bin/sh
+# 首次启动时配置 EasyTier 防火墙 (et zone + lan<->et 转发)
+# 只在 zone 不存在时添加，重复执行安全
+
+# 添加 et zone (device=tun0, 允许转发 + NAT)
+if ! uci -q get firewall.et_zone >/dev/null 2>&1; then
+  uci add firewall zone
+  uci rename firewall.@zone[-1]=et_zone
+  uci set firewall.et_zone.name=et
+  uci set firewall.et_zone.device=tun0
+  uci set firewall.et_zone.forward=ACCEPT
+  uci set firewall.et_zone.input=ACCEPT
+  uci set firewall.et_zone.output=ACCEPT
+  uci set firewall.et_zone.masq=1
+  uci set firewall.et_zone.mtu_fix=1
+fi
+
+# lan -> et 转发
+if ! uci -q get firewall.et_lan_fwd >/dev/null 2>&1; then
+  uci add firewall forwarding
+  uci rename firewall.@forwarding[-1]=et_lan_fwd
+  uci set firewall.et_lan_fwd.src=lan
+  uci set firewall.et_lan_fwd.dest=et
+fi
+
+# et -> lan 转发
+if ! uci -q get firewall.et_lan_fwd_rev >/dev/null 2>&1; then
+  uci add firewall forwarding
+  uci rename firewall.@forwarding[-1]=et_lan_fwd_rev
+  uci set firewall.et_lan_fwd_rev.src=et
+  uci set firewall.et_lan_fwd_rev.dest=lan
+fi
+
+uci commit firewall
+
+# 启用 z1 开机自启
+/etc/init.d/et-z1 enable 2>/dev/null
+
+exit 0

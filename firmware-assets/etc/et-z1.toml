@@ -1,0 +1,17 @@
+instance_name = "z1-test"
+hostname = "mi4a"
+ipv4 = "10.126.126.6"
+listeners = ["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010"]
+
+[network_identity]
+network_name = "123"
+network_secret = "123"
+
+[flags]
+enable_encryption = false
+
+[[proxy_network]]
+cidr = "192.168.31.0/24"
+
+[[peer]]
+uri = "ws://mir3g-nas.gd.ddnsto.com:5000"
